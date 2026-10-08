@@ -16,11 +16,11 @@ def h(state):
 def dh(state):
     return np.array([[1., 0., 0.], [0., 1., 0.]])
 
-def observe(states, W, tau, rng):
+def observe(states, Q, tau, rng):
     """
-    noisy observations of the positions, with covariance W / tau (same scaling as in the EKF)
+    noisy observations of the positions, with covariance Q / tau (same scaling as in the EKF)
     """
-    noise = rng.multivariate_normal(np.zeros(2), W / tau, size=len(states))
+    noise = rng.multivariate_normal(np.zeros(2), Q / tau, size=len(states))
     return np.array([h(s) for s in states]) + noise
 
 def wrap(angle):
@@ -41,11 +41,11 @@ if __name__ == "__main__":
 
     ### observations
     sigma_obs = 0.2                          # std of one position measurement
-    W = sigma_obs**2 * tau * np.eye(2)       # observation noise, scaled by 1/tau in the EKF
-    observations = observe(states, W, tau, rng)
+    Q = sigma_obs**2 * tau * np.eye(2)       # observation noise, scaled by 1/tau in the EKF
+    observations = observe(states, Q, tau, rng)
 
     ### filter: same phi_tau as the particle, but free to move in the whole plane
-    Q = np.diag([1e-3, 1e-3, 1.0])           # model noise, scaled by tau in the EKF
+    W = np.diag([1e-3, 1e-3, 1.0])           # model noise, scaled by tau in the EKF
     x0 = np.array([2.4, 1.3, 0.4])           # wrong initial guess
     Pi0 = np.diag([0.25, 0.25, 0.5])
 

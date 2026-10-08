@@ -1,4 +1,7 @@
 import numpy as np 
+import matplotlib.pyplot as plt 
+from scipy.interpolate import RectBivariateSpline
+
 
 ### my own imports 
 from value_functions import ValueFunction
@@ -32,9 +35,8 @@ class Kalman:
         self.tau = tau  # Time step 
 
         ### matrix scalings #############
-        self.Q_tau = self.tau * self.Q 
-        self.W_tau = self.tau**-1 * self.W
-        self.R_tau = self.tau**-1 * self.R
+        self.Q_tau = self.tau**-1 * self.Q   # observation noise over one step
+        self.W_tau = self.tau * self.W       # model noise over one step
         ################################# 
 
         self.A = A # update matrix 
@@ -42,7 +44,7 @@ class Kalman:
         self.observed_trajectory = observed_trajectory # Observed trajectory 
 
         ### value functions
-        self.value_function_minus = ValueFunction(Pi0, x0) # corresponds to W and not V ! 
+        self.value_function_minus = ValueFunction(Pi0, x0) 
         self.value_functions_minus = [self.value_function_minus]
 
         self.value_function_plus = None
@@ -55,7 +57,7 @@ class Kalman:
         # update the state and covariance
         if self.x_plus is not None:
             self.x_minus = self.A @ self.x_plus 
-            self.Pi_minus = self.A @ self.Pi_plus @ self.A.T + self.Q_tau    
+            self.Pi_minus = self.A @ self.Pi_plus @ self.A.T + self.W_tau
 
             self.states_minus.append(self.x_minus) 
             self.Pi_minus_list.append(self.Pi_minus)
@@ -72,13 +74,13 @@ class Kalman:
         y = self.observed_trajectory[self.n]
         z =  y - self.H @ self.x_minus  
         # compute the Kalman Gain
-        to_inv = self.W_tau + self.H @ self.Pi_minus @ self.H.T 
+        to_inv = self.Q_tau + self.H @ self.Pi_minus @ self.H.T 
         G = self.Pi_minus @ self.H.T @ np.linalg.inv(to_inv) 
 
         # update the covariance 
         I = np.eye(self.x_minus.shape[0])   
         M = I - G @ self.H
-        self.Pi_plus =  M @ self.Pi_minus @ M.T  + G @ self.W_tau @ G.T
+        self.Pi_plus =  M @ self.Pi_minus @ M.T  + G @ self.Q_tau @ G.T
         # update the state
         z = np.atleast_1d(z) # safety check for matrix multiplication
         self.x_plus = self.x_minus + G @ z
@@ -100,7 +102,38 @@ class Kalman:
                 self.correction()
 
         self.has_run = True 
+    
+    def plot_estimations(self, ax, iterations, with_covariances=True):
+        assert self.dimension == 1, "Plotting only implemented for d=1"
 
+        states_to_plot = np.array(self.states_minus)
+        ax.plot(
+            iterations,
+            states_to_plot[:,0],
+            color='red', 
+            marker='o',
+            linestyle='dashed',
+            label=r'Kalman estimation : $\hat{x}_{n^-}$'
+        ) 
+        if with_covariances:
+            # corresponding to the level set of | V - min V| = 1  
+            quantile = 2 ** 0.5 
+            states = np.array(self.states_minus).flatten()
+            cov_array = np.array(self.Pi_minus_list).flatten()
+
+            lower_bounds = states - quantile*cov_array  
+            upper_bounds = states + quantile*cov_array
+
+            ax.fill_between(
+                iterations,
+                lower_bounds, 
+                upper_bounds, 
+                color=self.color,
+                alpha=.1,
+                label=r'84% confidence interval ($\sqrt{2}\sigma$)'
+            ) 
+        ax.set_xlabel('time')
+        ax.legend(loc='upper left', prop={'size': 8})
     
 class EKF:
     def __init__(self, x0, Pi0, Q, W, tau, Phi, dPhi, h, dh, observed_trajectory, initialize_with_plus):
@@ -158,9 +191,8 @@ class EKF:
         self.tau = tau  # Time step 
 
         ### matrix scalings ###############
-        self.Q_tau = self.tau * self.Q 
-        self.W_tau = self.tau**-1 * self.W
-        self.R_tau = self.tau**-1 *  self.R
+        self.Q_tau = self.tau**-1 * self.Q   # observation noise over one step
+        self.W_tau = self.tau * self.W       # model noise over one step
         ###################################
 
         self.Phi = Phi  # State transition function
@@ -178,7 +210,7 @@ class EKF:
             A = self.dPhi(self.x_plus)
             A = np.atleast_2d(A) # safety check for d=1 
             self.x_minus = self.Phi(self.x_plus) 
-            self.Pi_minus = A @ self.Pi_plus @ A.T + self.Q_tau  # Update estimate covariance
+            self.Pi_minus = A @ self.Pi_plus @ A.T + self.W_tau  # Update estimate covariance
 
             self.states_minus.append(self.x_minus) 
             self.Pi_minus_list.append(self.Pi_minus)
@@ -196,13 +228,13 @@ class EKF:
         y = self.observed_trajectory[self.n]
         z =  y - self.h(self.x_minus)  # Measurement residual
         H = self.dh(self.x_minus)
-        to_inv = self.W_tau + H @ self.Pi_minus @ H.T 
+        to_inv = self.Q_tau + H @ self.Pi_minus @ H.T 
         G = self.Pi_minus @ H.T @ np.linalg.inv(to_inv)  # Kalman Gain
 
         # update the covariance 
         I = np.eye(self.x_minus.shape[0])   
         M = I - G @ H
-        self.Pi_plus =  M @ self.Pi_minus @ M.T + G @ self.W_tau @ G.T
+        self.Pi_plus =  M @ self.Pi_minus @ M.T + G @ self.Q_tau @ G.T
         # update the state 
         z = np.atleast_1d(z) # safety check for matrix multiplication 
         self.x_plus = self.x_minus + G @ z
@@ -224,7 +256,99 @@ class EKF:
                 self.correction()
 
         self.has_run = True 
+        
 
-    
 if __name__ == "__main__":
-    print("main file")
+
+    d = 1
+
+    ### EKF 
+    x0 = np.zeros(d)  # Initial state estimate
+    Pi0 = np.eye(d)  # Initial estimate covariance
+    Q = np.eye(d) * 0.1  # Process noise covariance
+    R = np.eye(d) * 0.1  # Measurement noise covariance
+    tau = 0.1
+    Phi = lambda x: np.eye(x.shape[0]) @ x
+    dPhi = lambda x: np.eye(x.shape[0]) 
+    h = lambda x: x
+    dh = lambda x: np.eye(x.shape[0]) 
+    
+    T = 10.
+    n_iterations = round(T/tau) 
+
+    target = np.random.randint(10)
+    print(f"target is set to {target}")  
+    observed_trajectory = [target*np.ones(d)]*n_iterations
+
+    observer = EKF(
+        x0,
+        Pi0,
+        Q,
+        R,
+        tau,
+        Phi,
+        dPhi,
+        h,
+        dh,
+        observed_trajectory, 
+        initialize_with_plus=False
+    )
+
+    observer.run_full(n_iterations)
+    assert observer.has_run 
+    print("Final estimation : ", observer.states_minus[-1])
+
+    ### Kalman 
+    A = np.eye(d) 
+    H = np.eye(d) 
+
+    kalman_filter = Kalman(
+        x0, 
+        Pi0, 
+        Q, 
+        R, 
+        tau,
+        A, 
+        H, 
+        observed_trajectory
+    )
+
+    kalman_filter.run_full(n_iterations) 
+    assert kalman_filter.has_run 
+    print("Final Kalman estimation : ", kalman_filter.states_minus[-1])
+
+    ### Plotting 
+    fig, ax = plt.subplots(figsize=(12, 6), dpi=150)
+
+    iterations = np.linspace(0, observer.tau*observer.n, observer.n) 
+
+    ax.plot(
+        iterations,
+        observed_trajectory,
+        color='green', 
+        marker='x',
+        label=r'target : $y$'
+    ) 
+    states_to_plot = np.array(observer.states_minus)
+    ax.plot(
+        iterations,
+        states_to_plot[:,0],
+        color='blue', 
+        marker='o',
+        linestyle='dashed',
+        label=r'EKF estimation : $\hat{x}_{n^-}$'
+    ) 
+
+    Kalman_states = np.array(kalman_filter.states_minus)
+    ax.plot(    
+        iterations,
+        Kalman_states[:,0],
+        color='red', 
+        marker='o',
+        linestyle='dashed',
+        label=r'kalman estimation : $\hat{x}_{n^-}$'
+    ) 
+    ax.set_xlabel('time')
+    ax.legend() 
+
+    plt.show() 
