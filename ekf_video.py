@@ -1,9 +1,15 @@
+import os
 import sys
 import itertools
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, FFMpegWriter
-from matplotlib.patches import Ellipse
+from matplotlib.patches import Ellipse, Circle
+from matplotlib.legend_handler import HandlerBase
+from matplotlib.image import BboxImage
+from matplotlib.transforms import Bbox, TransformedBbox
+from PIL import Image
+from scipy import ndimage
 
 ### my own imports
 from grid import Grid2D
@@ -34,6 +40,129 @@ COLORS = dict(
     escape='#e74c3c',
 )
 
+### pictures of the characters (any format readable by Pillow), drawn `size` grid units wide in place of their dot.
+### The thief is cut out of its background and keeps a red halo; the superhero is a round badge (crop `circle` =
+### (centre x, centre y, radius) as fractions of the picture height) with a blue ring.
+### Without the file, the character is a plain dot
+IMAGES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'images')
+CHARACTERS = {
+    'true_dot': dict(image=os.path.join(IMAGES_DIR, 'pain_au_chocolat.jpg'), size=0.8),
+    'est_dot': dict(image=os.path.join(IMAGES_DIR, 'super_hero.png'), size=0.65, circle=(0.44, 0.44, 0.31)),
+}
+
+def load_sprite(path, size=256, circle=None):
+    """
+    load an image as a square RGBA array of size x size pixels, cropped to its content.
+    With circle = (cx, cy, r), the picture is cropped to that disc (fractions of the picture height for r).
+    Otherwise an image without transparency (e.g. a jpg photo) gets its light, colourless background removed:
+    the light gray pixels connected to the border of the image become transparent
+    """
+    rgba = np.asarray(Image.open(path).convert('RGBA')).astype(float) / 255
+    alpha = rgba[..., 3]
+    if circle is not None:
+        h, w = alpha.shape
+        cx, cy, r = circle[0] * w, circle[1] * h, circle[2] * h
+        yy, xx = np.mgrid[:h, :w]
+        # antialiased disc: alpha goes from 1 to 0 over the last pixel of the radius
+        alpha = alpha * np.clip(r - np.hypot(xx + 0.5 - cx, yy + 0.5 - cy), 0, 1)
+    elif alpha.min() == 1:
+        rgb = rgba[..., :3]
+        value, saturation = rgb.max(2), np.ptp(rgb, axis=2) / np.maximum(rgb.max(2), 1e-6)
+        labels, _ = ndimage.label((saturation < 0.08) & (value > 0.55))
+        border = np.unique(np.concatenate([labels[0], labels[-1], labels[:, 0], labels[:, -1]]))
+        background = np.isin(labels, border[border > 0])
+        # shave the pale fringe of the shadow, then soften the edge
+        alpha = ndimage.gaussian_filter(ndimage.binary_erosion(~background, iterations=2).astype(float), 1.5)
+    rows, cols = np.nonzero(alpha > 0.05)
+    rgba = np.dstack([rgba[..., :3], alpha])[rows.min():rows.max()+1, cols.min():cols.max()+1]
+
+    # pad to a square, centred, then downscale
+    h, w = rgba.shape[:2]
+    side = max(h, w)
+    square = np.zeros((side, side, 4))
+    square[(side - h)//2:(side - h)//2 + h, (side - w)//2:(side - w)//2 + w] = rgba
+    square = Image.fromarray((square * 255).astype(np.uint8), 'RGBA').resize((size, size), Image.LANCZOS)
+    return np.asarray(square)
+
+class HandlerImage(HandlerBase):
+    """
+    legend entry drawn as a picture
+    """
+    def __init__(self, image, scale=2.2):
+        super().__init__()
+        self.image = image
+        self.scale = scale
+
+    def create_artists(self, legend, orig_handle, xdescent, ydescent, width, height, fontsize, trans):
+        size = self.scale * height
+        bbox = Bbox.from_bounds(-xdescent + (width - size) / 2, -ydescent + (height - size) / 2, size, size)
+        image = BboxImage(TransformedBbox(bbox, trans))
+        image.set_data(self.image)
+        return [image]
+
+def move_character(artists, key, x, y):
+    """
+    draw the character key ('true_dot' for the thief, 'est_dot' for the superhero) at (x, y):
+    its dot, and its picture and ring if it has some
+    """
+    artists[key].set_data([x], [y])
+    if key + '_img' in artists:
+        r = CHARACTERS[key]['size'] / 2
+        artists[key + '_img'].set_extent((x - r, x + r, y - r, y + r))
+        artists[key + '_img'].set_visible(True)
+    if key + '_ring' in artists:
+        artists[key + '_ring'].set_center((x, y))
+        artists[key + '_ring'].set_visible(True)
+
+### the city: some blocks between the streets get a house, a tree or two small trees, drawn from these pictures
+### (png versions of the svg files of images/, made with
+###   convert -background none -density 384 images/house.svg -resize 256x256 images/house.png)
+### The layout is random but fixed by CITY_SEED, so the city is the same in every game
+CITY_IMAGES = dict(house=os.path.join(IMAGES_DIR, 'house.png'), tree=os.path.join(IMAGES_DIR, 'tree.png'))
+CITY_SEED = 3
+# fraction of the blocks with a house, a tree, two trees (the others stay empty)
+CITY_DENSITY = dict(house=0.20, tree=0.10, two_trees=0.05)
+
+def draw_city(ax, grid, px_per_unit=80):
+    """
+    draw the houses and trees in the blocks of the grid. They are pasted once into a single picture covering the
+    map, so that the animation does not redraw 100 small images at every frame
+    """
+    if not all(os.path.exists(path) for path in CITY_IMAGES.values()):
+        return
+    rng = np.random.default_rng(CITY_SEED)
+    pictures = {name: Image.fromarray(load_sprite(path, size=128)) for name, path in CITY_IMAGES.items()}
+    x0, y1 = grid.x_min - 0.5, grid.y_max + 0.5 # top-left corner of the picture
+    width = int(round((grid.xlength + 1) * px_per_unit))
+    height = int(round((grid.ylength + 1) * px_per_unit))
+    city = Image.new('RGBA', (width, height), (0, 0, 0, 0))
+
+    def paste(name, x, y, size):
+        # centre (x, y) and size in grid units
+        side = int(round(size * px_per_unit))
+        picture = pictures[name].resize((side, side), Image.LANCZOS)
+        left = int(round((x - x0) * px_per_unit)) - side // 2
+        top = int(round((y1 - y) * px_per_unit)) - side // 2
+        city.alpha_composite(picture, (left, top))
+
+    for i in range(grid.Nx):
+        for j in range(grid.Ny):
+            # centre of the block between nodes (i, j) and (i+1, j+1)
+            x = grid.x_min + (i + 0.5) * grid.dx
+            y = grid.y_min + (j + 0.5) * grid.dy
+            u = rng.random()
+            if u < CITY_DENSITY['house']:
+                paste('house', x, y, 0.55)
+            elif u < CITY_DENSITY['house'] + CITY_DENSITY['tree']:
+                paste('tree', x, y, 0.55)
+            elif u < sum(CITY_DENSITY.values()):
+                paste('tree', x - 0.17, y + 0.08, 0.38)
+                paste('tree', x + 0.17, y - 0.08, 0.38)
+
+    # above the streets (zorder 1), below the crossroads (zorder 2)
+    ax.imshow(np.asarray(city), extent=(x0, grid.x_max + 0.5, grid.y_min - 0.5, y1), zorder=1.5,
+              interpolation='antialiased')
+
 def setup_plot(ax, grid):
     """
     draw the grid and create the (empty) artists of the animation
@@ -42,6 +171,15 @@ def setup_plot(ax, grid):
     ax.figure.set_facecolor(c['background'])
     ax.set_facecolor(c['background'])
     grid.plot_grid(ax=ax, node_size=90, node_color=c['node'], line_color=c['street'], line_width=3)
+    draw_city(ax, grid)
+    # pictures of the characters (created before setting the limits, imshow changes them)
+    sprites, images = {}, {}
+    for key, zorder in [('true_dot', 7.5), ('est_dot', 8.5)]:
+        ch = CHARACTERS[key]
+        if os.path.exists(ch['image']):
+            sprites[key] = load_sprite(ch['image'], circle=ch.get('circle'))
+            images[key] = ax.imshow(sprites[key], extent=(0, 1, 0, 1), zorder=zorder, interpolation='antialiased')
+            images[key].set_visible(False)
     ax.set_xlim(grid.x_min - 0.5, grid.x_max + 0.5)
     ax.set_ylim(grid.y_min - 0.5, grid.y_max + 0.5)
     ax.set_xticks([])
@@ -53,11 +191,14 @@ def setup_plot(ax, grid):
         obs_past=ax.scatter([], [], s=25, color=c['clue'], edgecolor='#b7950b', lw=0.5, alpha=0.7, zorder=3,
                             label='indices'),
         true_line=ax.plot([], [], color=c['thief'], lw=3, zorder=4, label='chemin du voleur')[0],
-        true_dot=ax.plot([], [], 'o', color=c['thief'], mec='white', mew=2, ms=18, zorder=7, label='voleur')[0],
-        est_line=ax.plot([], [], color=c['hero'], lw=3, zorder=5, label='chemin du super-héros')[0],
-        est_dot=ax.plot([], [], 'o', color=c['hero'], mec='white', mew=2, ms=18, zorder=8, label='super-héros')[0],
+        # with a picture, the red dot becomes a halo under it, to keep the colour code
+        true_dot=ax.plot([], [], 'o', color=c['thief'], mec='white', mew=2,
+                         ms=28 if 'true_dot' in sprites else 18, alpha=0.35 if 'true_dot' in sprites else 1,
+                         zorder=7, label='voleur')[0],
+        est_line=ax.plot([], [], color=c['hero'], lw=3, zorder=5, label='chemin de la super-héroïne')[0],
+        est_dot=ax.plot([], [], 'o', color=c['hero'], mec='white', mew=2, ms=18, zorder=8, label='super-héroïne')[0],
         prior_dot=ax.plot([], [], 'o', mfc='none', mec=c['hero'], mew=3, ms=22, zorder=6,
-                          label='départ du super-héros')[0],
+                          label='départ de la super-héroïne')[0],
         ellipse=ax.add_patch(Ellipse((0, 0), 0, 0, facecolor=c['hero'], edgecolor=c['hero'], alpha=0.15,
                                      zorder=4, label='zone de recherche')),
         title=ax.set_title('', fontsize=16, fontweight='bold', color='#34495e'),
@@ -66,11 +207,19 @@ def setup_plot(ax, grid):
                        bbox=dict(boxstyle='round,pad=0.6', facecolor=c['catch'], edgecolor='white', lw=3)),
     )
     artists['banner'].set_visible(False)
+    for key, image in images.items():
+        artists[key + '_img'] = image
+    if 'est_dot' in sprites:
+        # the superhero badge replaces the blue dot, and gets a blue ring to keep the colour code
+        artists['est_dot'].set_visible(False)
+        artists['est_dot_ring'] = ax.add_patch(Circle((0, 0), CHARACTERS['est_dot']['size'] / 2, fill=False,
+                                                      edgecolor=c['hero'], lw=3, zorder=8.6, visible=False))
     # one legend column per character: thief, superhero, start, clues
     order = ['true_dot', 'true_line', 'est_dot', 'est_line', 'prior_dot', 'ellipse', 'obs_past']
+    handler_map = {artists[key]: HandlerImage(sprite) for key, sprite in sprites.items()}
     ax.legend([artists[k] for k in order], [artists[k].get_label() for k in order],
               loc='upper center', bbox_to_anchor=(0.5, -0.01), ncol=4, frameon=False, fontsize=10,
-              markerscale=0.7)
+              markerscale=0.7, columnspacing=1.0, handler_map=handler_map)
     return artists
 
 CATCH_MESSAGE = "Le voleur a été rattrapé !"
@@ -99,9 +248,9 @@ def make_update(artists, states, observations, ekf, tau, catch_tol=1e-1):
         n = max(k - 1, 0) # time index of the true state
         a['obs_past'].set_offsets(observations[:k].reshape(-1, 2))
         a['true_line'].set_data(states[:n+1, 0], states[:n+1, 1])
-        a['true_dot'].set_data([states[n, 0]], [states[n, 1]])
+        move_character(a, 'true_dot', states[n, 0], states[n, 1])
         a['est_line'].set_data(estimates[:k+1, 0], estimates[:k+1, 1])
-        a['est_dot'].set_data([estimates[k, 0]], [estimates[k, 1]])
+        move_character(a, 'est_dot', estimates[k, 0], estimates[k, 1])
 
         center, width, height, angle = covariance_ellipse(estimates[k, :2], covs[k])
         a['ellipse'].set_center(center)
@@ -151,6 +300,9 @@ def clear_plot(artists):
     artists['ellipse'].set_width(0)
     artists['ellipse'].set_height(0)
     artists['banner'].set_visible(False)
+    for key in ['true_dot_img', 'est_dot_img', 'est_dot_ring']:
+        if key in artists:
+            artists[key].set_visible(False)
 
 def interactive(grid, new_game, run_ekf, tau, fps=10):
     """
@@ -170,8 +322,8 @@ def interactive(grid, new_game, run_ekf, tau, fps=10):
         game = new_game()
         run.update(game=game, update=None, frames=[], i=0, caught=False)
         clear_plot(artists)
-        artists['true_dot'].set_data([game['states'][0, 0]], [game['states'][0, 1]])
-        artists['title'].set_text('Clique sur un carrefour pour placer le super-héros')
+        move_character(artists, 'true_dot', game['states'][0, 0], game['states'][0, 1])
+        artists['title'].set_text('Clique sur un carrefour pour placer la super-héroïne')
         fig.canvas.draw_idle()
 
     def on_click(event):
